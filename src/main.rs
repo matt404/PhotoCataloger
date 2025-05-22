@@ -118,3 +118,73 @@ fn main() -> Result<(), Error> {
     println!("Image cataloging complete!");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_init_database() -> Result<(), Error> {
+        let conn = Connection::open_in_memory()?;
+        init_database(&conn)?;
+        
+        // Verify table exists and has correct schema
+        let table_info: Vec<(String,)> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='images'")?
+            .query_map([], |row| Ok((row.get(0)?,)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        
+        assert_eq!(table_info.len(), 1);
+        assert_eq!(table_info[0].0, "images");
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_image() -> Result<(), Error> {
+        let dir = tempdir()?;
+        let test_image_path = dir.path().join("test.jpg");
+        
+        // Create a minimal valid JPEG file
+        let mut file = File::create(&test_image_path)?;
+        // Write JPEG magic bytes
+        file.write_all(&[0xFF, 0xD8, 0xFF, 0xE0])?;
+        file.write_all(&[0x00, 0x10])?; // length
+        file.write_all(b"JFIF\0")?;
+        file.write_all(&[0x01, 0x01])?; // version
+        file.write_all(&[0x00])?; // units
+        file.write_all(&[0x00, 0x01])?; // x density
+        file.write_all(&[0x00, 0x01])?; // y density
+        file.write_all(&[0x00, 0x00])?; // thumbnail
+        file.write_all(&[0xFF, 0xD9])?; // EOI marker
+        
+        let metadata = process_image(&test_image_path)?;
+        
+        assert_eq!(metadata.file_name, "test.jpg");
+        assert!(metadata.file_size > 0);
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory() -> Result<(), Error> {
+        let dir = tempdir()?;
+        let conn = Connection::open_in_memory()?;
+        init_database(&conn)?;
+        
+        // Create test directory structure with a test image
+        let test_image_path = dir.path().join("test.jpg");
+        let mut file = File::create(&test_image_path)?;
+        file.write_all(&[0xFF, 0xD8, 0xFF, 0xE0])?; // JPEG magic bytes
+        file.write_all(&[0xFF, 0xD9])?; // EOI marker
+        
+        scan_directory(dir.path(), &conn)?;
+        
+        // Verify image was processed and added to database
+        let count: i32 = conn.query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+        
+        Ok(())
+    }
+}
