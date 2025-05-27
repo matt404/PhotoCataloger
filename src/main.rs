@@ -7,6 +7,10 @@ use exif::{Reader, In};
 use anyhow::Error;
 use serde_json::Value;
 use reqwest;
+use image::GenericImageView;
+use std::env;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 
 struct ImageMetadata {
     path: String,
@@ -41,12 +45,12 @@ fn init_database(conn: &Connection) -> Result<()> {
 async fn get_image_analysis(image_path: &Path) -> Result<(String, String), Error> {
     // Read the image file as base64
     let image_data = fs::read(image_path)?;
-    let base64_image = base64::encode(image_data);
+    let base64_image = STANDARD.encode(image_data);
 
     // Create the client
     let client = reqwest::Client::new();
 
-    // Prepare the prompt for Ollama
+    // Prepare the prompt
     let prompt = format!(
         "Analyze this image and provide: \
         1. A concise description of what you see \
@@ -56,30 +60,41 @@ async fn get_image_analysis(image_path: &Path) -> Result<(String, String), Error
     // Make request to local Ollama server
     let response = client
         .post("http://localhost:11434/api/generate")
-        .json(&serde_json::json!({
-            "model": "llava",  // Using llava model as it's good for image analysis
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({
+            "model": "llava",
             "prompt": prompt,
             "images": [base64_image],
             "stream": false
-        }))
+        }).to_string())
         .send()
         .await?;
 
+    // Get the response text as a String
     let response_text = response.text().await?;
+
+    // Parse the JSON response
     let response_json: Value = serde_json::from_str(&response_text)?;
 
-    // Parse the response
-    let full_response = response_json["response"].as_str()
+    // Extract the response field and convert to owned String
+    let full_response = response_json["response"]
+        .as_str()
         .unwrap_or("No response")
-        .to_string();
+        .to_owned();
 
     // Split the response into description and keywords
+    // Split the response into description and keywords
     let parts: Vec<&str> = full_response.split("\n\n").collect();
-    let description = parts.get(0).unwrap_or(&"").to_string();
-    let keywords = parts.get(1)
+    let description = parts.get(0).unwrap_or(&"").to_string();  // Changed to to_string()
+    let keywords = parts
+        .get(1)
         .unwrap_or(&"")
         .trim_start_matches("Keywords: ")
-        .to_string();
+        .to_string();  // Changed to to_string()
+    
+    // print keywords and description
+    println!("Keywords: {}", keywords);
+    println!("Description: {}", description);
 
     Ok((description, keywords))
 }
@@ -92,11 +107,12 @@ fn process_image(path: &Path) -> Result<ImageMetadata, Error> {
 
     let metadata = fs::metadata(path)?;
     let file_size = metadata.len();
-
-    // Get image dimensions and format
-    let img = image::open(path).ok();
+    
+    // Instead of trying to get format from DynamicImage
+    let file = fs::read(path)?;
+    let img = image::load_from_memory(&file).ok();
     let dimensions = img.as_ref().map(|img| img.dimensions());
-    let format = img.map(|img| img.format());
+    let format = image::guess_format(&file).ok();
 
     // Get EXIF data for creation date
     let file = fs::File::open(path)?;
@@ -142,6 +158,53 @@ fn save_metadata(conn: &Connection, metadata: &ImageMetadata) -> Result<()> {
             metadata.description,
         ],
     )?;
+    Ok(())
+}
+
+fn main() -> Result<(), Error> {
+    // Get the directory to scan from command line argument or use current directory
+    let scan_dir = env::args().nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap());
+
+    println!("Scanning directory: {}", scan_dir.display());
+
+    // Initialize SQLite database
+    let conn = Connection::open("photo_catalog.db")?;
+    init_database(&conn)?;
+
+    // Count for processed images
+    let mut processed_count = 0;
+
+    // Walk through the directory
+    for entry in WalkDir::new(scan_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension()
+                .map(|ext| {
+                    let ext = ext.to_string_lossy().to_lowercase();
+                    matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp")
+                })
+                .unwrap_or(false)
+        })
+    {
+        match process_image(entry.path()) {
+            Ok(metadata) => {
+                println!("Processing: {}", entry.path().display());
+                if let Err(e) = save_metadata(&conn, &metadata) {
+                    eprintln!("Error saving metadata for {}: {}", entry.path().display(), e);
+                } else {
+                    processed_count += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error processing {}: {}", entry.path().display(), e);
+            }
+        }
+    }
+
+    println!("Successfully processed {} images", processed_count);
     Ok(())
 }
 
